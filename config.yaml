@@ -1,0 +1,17 @@
+binance:
+  apiKey: 'AppzE59Z1cF5pGUTmGcE2hxlI0oWa00TYhpD6PBj5EAW9cH2WpFflmXOH6EuWo5y'
+  secret: '11sfe1D2H9lYKrkQuHZC9n72kJErJNAZqL0oxwmPvsbAdcF6kNUBB47YYXqQQsjH'
+
+trading:
+  pairs:
+    - 'SOL/USDC'
+    - 'SOL/ETH'
+    - 'SOL/BTC'
+    - 'ETH/BTC'
+    - 'BTC/USDC'
+    - 'ETH/USDC'
+
+logging:
+  file: 'Multipairtradebot.log'
+  level: 'INFO'
+  format: '%(asctime)s - %(message)s'
