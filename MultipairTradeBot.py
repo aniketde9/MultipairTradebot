@@ -41,9 +41,27 @@ minimum_amount = 0.001
 trade_log = []
 maker_fee = 0.001  # Maker fee
 taker_fee = 0.001  # Taker fee
+desired_profit_margin = 0.0025  # Desired profit margin of 0.25%
 buy_prices = {}  # Dictionary to store buy prices and amounts for each pair
 model = None
 scaler = None
+initial_net_value = 0.0
+
+# Initialize trade log DataFrame
+trade_log_df = pd.DataFrame(columns=[
+    'Trade ID', 'Timestamp', 'Market', 'Type', 'Quantity', 'Price', 'Total', 'Fee', 'Associated Trade IDs', 'Profit/Loss'
+])
+trade_id = 1
+
+# Function to get the minimum notional value for a trading pair
+def get_min_notional_value(pair):
+    try:
+        markets = binance.load_markets()
+        min_notional = markets[pair]['limits']['cost']['min']
+        return min_notional
+    except Exception as e:
+        logging.error(f"Error fetching minimum notional value for {pair}: {e}")
+        return None
 
 # Synchronize with Binance server time
 def synchronize_time():
@@ -76,15 +94,21 @@ def retry_with_time_sync(delay=5):
 # Function to get the initial balance for specific assets
 @retry_with_time_sync()
 async def get_initial_balance():
-    global balances
+    global balances, initial_net_value
     balance = binance.fetch_balance()
     for asset in ['USDC', 'ETH', 'BTC', 'SOL']:
         if asset in balance['total']:
             balances[asset] = balance['total'][asset]
         else:
             balances[asset] = 0.0
+    # Fetch current prices
+    prices = await get_realtime_prices()
+    # Calculate initial net value
+    initial_net_value = sum(balances[asset] * prices[asset] for asset in balances)
     logging.info(f"Initial balances: {balances}")
+    logging.info(f"Initial net value: {initial_net_value}")
     print(f"Initial balances: {balances}")
+    print(f"Initial net value: {initial_net_value}")
 
 # Fetch historical prices for indicator calculation
 @retry_with_time_sync()
@@ -134,11 +158,48 @@ async def calculate_order_flow_imbalance(pair):
     order_flow_imbalance = (total_bids - total_asks) / (total_bids + total_asks)
     return order_flow_imbalance
 
+@retry_with_time_sync()
+async def get_last_order(pair, side):
+    try:
+        orders = binance.fetch_my_trades(pair)
+        if not orders:
+            return None
+        
+        # Filter the orders by side and get the last one
+        filtered_orders = [order for order in orders if order['side'] == side]
+        if not filtered_orders:
+            return None
+        
+        last_order = max(filtered_orders, key=lambda x: x['timestamp'])
+        return last_order['price'], last_order['amount']
+    except Exception as e:
+        logging.error(f"Error fetching last {side} order for {pair}: {e}")
+        return None, None
+
+# Function to check if a market pair is valid
+def is_valid_pair(pair):
+    try:
+        markets = binance.load_markets()
+        if pair in markets:
+            return True
+        else:
+            logging.warning(f"Market pair {pair} is not valid.")
+            return False
+    except Exception as e:
+        logging.error(f"Error verifying market pair {pair}: {e}")
+        return False
+
 # Function to place orders
 @retry_with_time_sync()
 async def place_order(pair, side, amount, price):
     try:
         synchronize_time()  # Synchronize time before making the API call
+        if not is_valid_pair(pair):
+            return None
+        min_notional = get_min_notional_value(pair)
+        if min_notional is None or amount * price < min_notional:
+            logging.warning(f"Order value {amount * price} for {pair} is below the minimum notional value {min_notional}")
+            return None
         if side == 'buy':
             order = binance.create_limit_buy_order(pair, amount, price)
         else:
@@ -183,12 +244,53 @@ async def dynamic_signal_generation(pair):
 
     return buy_signal, sell_signal, market_price, atr, indicators
 
+# Function to fetch real-time prices for all assets in USDC
+async def get_realtime_prices():
+    prices = {}
+    for asset in ['USDC', 'ETH', 'BTC', 'SOL']:
+        if asset == 'USDC':
+            prices[asset] = 1.0
+        else:
+            ticker = binance.fetch_ticker(f'{asset}/USDC')
+            prices[asset] = ticker['last']
+    return prices
+
+# Function to calculate the net value of holdings in USDC
+async def calculate_net_value():
+    prices = await get_realtime_prices()
+    net_value = sum(balances[asset] * prices[asset] for asset in balances)
+    return net_value
+
+# Function to log trades and calculate profit/loss
+def log_trade(trade_id, timestamp, pair, side, amount, price, total, fee, associated_trade_ids='', profit_loss=None):
+    global trade_log_df
+    new_trade = pd.DataFrame([{
+        'Trade ID': trade_id,
+        'Timestamp': timestamp,
+        'Market': pair,
+        'Type': side.upper(),
+        'Quantity': amount,
+        'Price': price,
+        'Total': total,
+        'Fee': fee,
+        'Associated Trade IDs': associated_trade_ids,
+        'Profit/Loss': profit_loss
+        }])
+
+    trade_log_df = pd.concat([trade_log_df, new_trade], ignore_index=True)
+
+# Function to save trade log to CSV
+def save_trade_log():
+    trade_log_df.to_csv('Multipairtrade_log.csv', index=False)
+
 # Function to execute trade based on signal
 async def execute_trade(pair, signal, amount, price, atr, indicators):
-    global balances, trade_log, buy_prices
+    global balances, trade_log, buy_prices, trade_id
     try:
         # Fetch the updated balance before placing orders
         await update_balance()
+
+        initial_net_value = await calculate_net_value()
 
         if signal == 'buy':
             available_balance = balances[pair.split('/')[1]]
@@ -196,6 +298,13 @@ async def execute_trade(pair, signal, amount, price, atr, indicators):
             if trade_amount < minimum_amount:
                 logging.warning(f"Insufficient {pair.split('/')[1]} balance to buy minimum amount of {pair.split('/')[0]}. Required: {minimum_amount} {pair.split('/')[0]}")
                 return
+            total_cost = trade_amount * price
+            fee = total_cost * maker_fee
+            log_trade(trade_id, datetime.now(), pair, 'buy', trade_amount, price, total_cost, fee)
+            trade_id += 1
+            if pair not in buy_prices:
+                buy_prices[pair] = []
+            buy_prices[pair].append((price, trade_amount))
         else:
             available_balance = balances[pair.split('/')[0]]
             trade_amount = available_balance
@@ -203,11 +312,37 @@ async def execute_trade(pair, signal, amount, price, atr, indicators):
                 logging.warning(f"Trade amount {trade_amount} {pair.split('/')[0]} does not meet the minimum requirements")
                 return
 
-            effective_sold_amount = trade_amount * (1 - taker_fee)
-            profit = effective_sold_amount * price - available_balance
-            if profit <= 0:
-                logging.warning(f"No profit would be made after fees. Trade amount: {trade_amount}, Effective sold amount: {effective_sold_amount}, Profit: {profit}")
+            # Fetch the last buy price
+            last_buy_price, _ = await get_last_order(pair, 'buy')
+            if not last_buy_price:
+                logging.warning(f"No buy prices recorded for {pair}. Cannot execute sell.")
                 return
+
+            # Calculate the necessary sell price to ensure profit
+            min_sell_price = last_buy_price * (1 + maker_fee) * (1 + taker_fee) * (1 + desired_profit_margin)
+            if price < min_sell_price:
+                logging.warning(f"Sell price {price} is not sufficient to cover fees and desired profit margin. Required: {min_sell_price}")
+                return
+
+            effective_sold_amount = trade_amount * (1 - taker_fee)
+            sell_total = trade_amount * price
+            fee = sell_total * taker_fee
+            buy_total = sum([amount * buy_price for buy_price, amount in buy_prices.get(pair, [])])
+            profit_loss = sell_total - fee - buy_total
+
+            # Remove the matched buy prices
+            remaining_amount = trade_amount
+            for buy_price, buy_amount in buy_prices[pair][:]:
+                if remaining_amount <= 0:
+                    break
+                if buy_amount <= remaining_amount:
+                    remaining_amount -= buy_amount
+                    buy_prices[pair].remove((buy_price, buy_amount))
+                else:
+                    new_amount = buy_amount - remaining_amount
+                    buy_prices[pair].remove((buy_price, buy_amount))
+                    buy_prices[pair].append((buy_price, new_amount))
+                    remaining_amount = 0
 
         order = await place_order(pair, signal, trade_amount, price)
         if order:
@@ -216,29 +351,37 @@ async def execute_trade(pair, signal, amount, price, atr, indicators):
             order_status = binance.fetch_order(order['id'], pair)
             market_price = binance.fetch_ticker(pair)['last']  # Fetch the latest market price
             if order_status['status'] == 'open':
-                if signal == 'buy' and market_price < order['price'] * 0.98:
-                    logging.info(f"Replacing buy order for {pair} due to price drop: Order Price: {order['price']}, Market Price: {market_price}")
-                    await replace_order(pair, order['id'], signal, trade_amount, market_price)
-                elif signal == 'sell' and market_price > order['price'] * 1.02:
-                    logging.info(f"Replacing sell order for {pair} due to price rise: Order Price: {order['price']}, Market Price: {market_price}")
-                    await replace_order(pair, order['id'], signal, trade_amount, market_price)
+                # Order replacement logic
+                new_prices = await get_historical_prices(pair)
+                new_indicators = calculate_indicators(new_prices)
+                new_order_flow_imbalance = await calculate_order_flow_imbalance(pair)
+                new_indicators['order_flow_imbalance'] = new_order_flow_imbalance
+
+                new_rsi = new_indicators['rsi']
+                new_macd_line = new_indicators['macd_line']
+                new_macd_signal = new_indicators['macd_signal']
+                new_bb_upper = new_indicators['bb_upper']
+                new_bb_lower = new_indicators['bb_lower']
+                new_atr = new_indicators['atr']
+
+                new_market_price = new_prices['close'][-1]
+
+                if signal == 'buy':
+                    if new_market_price < order['price'] * 0.98:
+                        logging.info(f"Replacing buy order for {pair} due to price drop: Order Price: {order['price']}, New Market Price: {new_market_price}")
+                        await replace_order(pair, order['id'], signal, trade_amount, new_market_price)
+                    elif new_rsi < 25 or new_macd_line < new_macd_signal:
+                        logging.info(f"Canceling buy order for {pair} due to unfavorable indicators: RSI: {new_rsi}, MACD Line: {new_macd_line}, MACD Signal: {new_macd_signal}")
+                        await binance.cancel_order(order['id'], pair)
+                elif signal == 'sell':
+                    if new_market_price > order['price'] * 1.02:
+                        logging.info(f"Replacing sell order for {pair} due to price rise: Order Price: {order['price']}, New Market Price: {new_market_price}")
+                        await replace_order(pair, order['id'], signal, trade_amount, new_market_price)
+                    elif new_rsi > 75 or new_macd_line > new_macd_signal:
+                        logging.info(f"Canceling sell order for {pair} due to unfavorable indicators: RSI: {new_rsi}, MACD Line: {new_macd_line}, MACD Signal: {new_macd_signal}")
+                        await binance.cancel_order(order['id'], pair)
             elif order_status['status'] == 'closed':
                 filled_amount = order_status['filled']
-                if signal == 'buy':
-                    if pair not in buy_prices:
-                        buy_prices[pair] = []
-                    buy_prices[pair].append((price, filled_amount))  # Store buy price and amount
-                elif signal == 'sell':
-                    valid_sell = False
-                    if pair in buy_prices:
-                        for buy_price, buy_amount in buy_prices[pair]:
-                            if price > buy_price * (1 + maker_fee):  # Ensure selling price is higher than the buy price accounting for fees
-                                valid_sell = True
-                                buy_prices[pair].remove((buy_price, buy_amount))  # Remove the matched buy price after sell
-                                break
-                    if not valid_sell:
-                        logging.info(f"Skipping sell for {pair} due to no profitable buy price found. Market Price: {market_price}")
-                        return
                 trade_log.append({
                     'pair': pair,
                     'timestamp': datetime.now(),
@@ -258,6 +401,12 @@ async def execute_trade(pair, signal, amount, price, atr, indicators):
                 logging.info(f"Updated balances for {pair} - USDC: {balances['USDC']}, SOL: {balances['SOL']}")
             else:
                 logging.info(f"Order not filled for {pair}: {order_status}")
+
+        final_net_value = await calculate_net_value()
+        profit_loss = final_net_value - initial_net_value
+        log_trade(trade_id, datetime.now(), pair, signal, trade_amount, price, trade_amount * price, fee, profit_loss=profit_loss)
+        logging.info(f"Trade ID: {trade_id}, Pair: {pair}, Signal: {signal}, Initial Net Value: {initial_net_value}, Final Net Value: {final_net_value}, Profit/Loss: {profit_loss}")
+
     except Exception as e:
         logging.error(f"Error executing trade for {pair}: {e}")
 
@@ -352,7 +501,6 @@ async def main():
         await update_balance()
         tasks = [dynamic_signal_generation(pair) for pair in pairs]
         results = await asyncio.gather(*tasks)
-
         for i, pair in enumerate(pairs):
             buy_signal, sell_signal, market_price, atr, indicators = results[i]
             ml_buy_signal, ml_sell_signal = generate_ml_signal(indicators)
@@ -361,12 +509,13 @@ async def main():
 
             if buy_signal or ml_buy_signal:
                 logging.info(f"Buy signal generated for {pair} at price: {market_price}")
-                asyncio.create_task(execute_trade(pair, 'buy', 0, market_price, atr, indicators))  # Set amount to 0 for initial call
+                await execute_trade(pair, 'buy', 0, market_price, atr, indicators)  # Set amount to 0 for initial call
 
             if sell_signal or ml_sell_signal:
                 logging.info(f"Sell signal generated for {pair} at price: {market_price}")
-                asyncio.create_task(execute_trade(pair, 'sell', 0, market_price, atr, indicators))  # Set amount to 0 for initial call
+                await execute_trade(pair, 'sell', 0, market_price, atr, indicators)  # Set amount to 0 for initial call
 
+        save_trade_log()  # Save the trade log periodically
         await asyncio.sleep(60)
 
 if __name__ == '__main__':
@@ -375,6 +524,7 @@ if __name__ == '__main__':
 # Graceful shutdown handling
 def handle_exit(signum, frame):
     logging.info("Shutting down the bot...")
+    save_trade_log()  # Save the trade log before shutting down
     loop = asyncio.get_event_loop()
     loop.run_until_complete(asyncio.sleep(1))
     loop.close()
